@@ -102,6 +102,11 @@ jobs:
             exit 1
           fi
 
+          # 规范化 SendKey：去掉首尾空白/换行，兼容粘贴了完整 URL 的情况
+          SENDKEY=$(echo "$SENDKEY" | tr -d '[:space:]')
+          SENDKEY=$(echo "$SENDKEY" | sed -E 's#^https?://sctapi\.ftqq\.com/##; s#\.send$##; s#\?.*$##')
+          echo "SendKey 长度: ${#SENDKEY}（前4位: ${SENDKEY:0:4}）"
+
           echo "==> 6/7 推送微信通知"
           SIZE_MB=$((SIZE / 1048576))
           DESP=$(cat <<EOF | sed 's/^[[:space:]]*//'
