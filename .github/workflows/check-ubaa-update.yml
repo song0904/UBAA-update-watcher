@@ -1,0 +1,142 @@
+name: 检查 UBAA 鸿蒙版更新
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制推送测试通知（验证配置用）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检测新版本并推送通知
+        env:
+          SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          echo "==> 1/7 查询 BUAASubnet/UBAA 最新 Release"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/BUAASubnet/UBAA/releases/latest \
+            -o release.json
+
+          TAG=$(jq -r '.tag_name' release.json)
+          PUB=$(jq -r '.published_at' release.json)
+          echo "最新版本: $TAG"
+
+          echo "==> 2/7 提取鸿蒙 arm64 HAP 资产"
+          ASSET=$(jq -c '[.assets[] | select(.name | contains("harmonyos") and contains("arm64") and endswith(".hap"))][0] // empty' release.json)
+          NAME=$(echo "$ASSET" | jq -r '.name // empty')
+          URL=$(echo "$ASSET" | jq -r '.browser_download_url // empty')
+          DIGEST=$(echo "$ASSET" | jq -r '.digest // empty')
+          SIZE=$(echo "$ASSET" | jq -r '.size // 0')
+
+          if [ -z "$URL" ]; then
+            echo "本次 Release 未附带鸿蒙 HAP，跳过"
+            exit 0
+          fi
+          echo "安装包: $NAME"
+
+          echo "==> 3/7 与本地记录对比版本"
+          LAST=$(cat last-version.txt 2>/dev/null || echo "")
+          if [ "$LAST" = "$TAG" ] && [ "$FORCE" != "true" ]; then
+            echo "已是最新版本，无需通知"
+            exit 0
+          fi
+          echo "上次记录: ${LAST:-（无）} → 本次: $TAG"
+
+          echo "==> 4/7 下载并校验 SHA-256"
+          curl -fsSL "$URL" -o app.hap
+          ACTUAL="sha256:$(sha256sum app.hap | cut -d' ' -f1)"
+          if [ -n "$DIGEST" ] && [ "$ACTUAL" != "$DIGEST" ]; then
+            echo "校验失败：期望 $DIGEST，实际 $ACTUAL"
+            exit 1
+          fi
+          echo "校验通过：$ACTUAL"
+
+          echo "==> 5/7 探测国内可用的下载加速镜像"
+          MIRRORS=(
+            "https://ghfast.top/"
+            "https://gh-proxy.com/"
+            "https://ghproxy.net/"
+            "https://gh.llkk.cc/"
+            "https://moeyy.cn/gh-proxy/"
+          )
+          ACCEL_LINKS=""
+          ACCEL_OK=0
+          for M in "${MIRRORS[@]}"; do
+            PROBE_URL="${M}${URL}"
+            CODE=$(curl -sL -o /dev/null -r 0-1023 -w "%{http_code}" \
+              --connect-timeout 8 --max-time 25 "$PROBE_URL" 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ] || [ "$CODE" = "206" ]; then
+              ACCEL_OK=$((ACCEL_OK + 1))
+              ACCEL_LINKS="${ACCEL_LINKS}${ACCEL_OK}. [${M%/}](${PROBE_URL})"$'\n'
+              echo "  可用: $M (HTTP $CODE)"
+            else
+              echo "  不可用: $M (HTTP $CODE)"
+            fi
+            [ "$ACCEL_OK" -ge 3 ] && break
+          done
+          if [ "$ACCEL_OK" -eq 0 ]; then
+            ACCEL_LINKS="本次未探测到可用加速镜像，请用下方备用方案。"
+          fi
+          echo "可用镜像数: $ACCEL_OK"
+
+          if [ -z "$SENDKEY" ]; then
+            echo "未配置 SERVERCHAN_SENDKEY，跳过推送"
+            exit 1
+          fi
+
+          echo "==> 6/7 推送微信通知"
+          SIZE_MB=$((SIZE / 1048576))
+          DESP=$(cat <<EOF | sed 's/^[[:space:]]*//'
+          ## UBAA 鸿蒙版 $TAG 已发布
+
+          - **安装包**：$NAME（约 ${SIZE_MB} MB）
+          - **发布时间**：$PUB
+          - **SHA-256 校验**：通过
+
+          **国内加速下载（任选一个）**：
+          ${ACCEL_LINKS}
+          **官方原始链接**：[github.com]($URL)
+
+          下载后打开手机上的「小白调试助手」，选择该文件并点「开始调试（自动签名）」。若提示已安装，先卸载旧版再装。
+
+          ---
+          由 GitHub Actions 自动检测并发送。
+          EOF
+          )
+          RESP=$(curl -fsS "https://sctapi.ftqq.com/${SENDKEY}.send" \
+            --data-urlencode "title=UBAA 鸿蒙版更新：$TAG" \
+            --data-urlencode "desp=$DESP")
+          echo "$RESP"
+          echo "$RESP" | jq -e '.code == 0' > /dev/null || {
+            echo "推送失败，请检查 SendKey 配置"
+            exit 1
+          }
+
+          echo "==> 7/7 记录版本，避免重复通知"
+          echo "$TAG" > last-version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-version.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: 记录 UBAA 版本 $TAG"
+            git push
+          fi
+          echo "完成"
